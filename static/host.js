@@ -4,9 +4,15 @@ const token = location.pathname.split("/").filter(Boolean)[1];
 const errorEl = document.getElementById("error");
 const publishBtn = document.getElementById("publish");
 
-// 轮询按发起次序编号：只接受最新一次发起的状态请求的响应，迟到的旧快照整份丢弃，
-// 不会用旧时间点的数据覆盖较新状态（例如旧轮询的 closed=false 覆盖新轮询的封存状态）
+// 轮询按发起次序编号。响应是否采纳看"高水位"而不是"是否为最新发起"：
+// 只采纳发起序号晚于最近一次已采纳响应的结果（lastAppliedSeq）。这样当状态请求
+// 慢于 3 秒轮询间隔（例如每次 4 秒）、新请求已在途时，按发起顺序先后返回的连续
+// 成功响应仍会逐次推进页面，不会仅仅因为较新请求尚在途中就被整份丢弃；乱序晚到
+// 的旧快照（序号不大于已采纳的高水位）依旧整份作废，不能用旧时间点的数据覆盖较新
+// 状态（例如旧轮询的 closed=false 覆盖已采纳的封存状态）。网络失败不推进高水位，
+// 保持原错误处理：抖动时静默等下一次轮询，不触碰界面。
 let pollSeq = 0;
+let lastAppliedSeq = 0;
 // 封存一旦在本页确认（收到 closed=true 快照，或封存请求被服务端接受）即永久锁存：
 // 此后迟到的 closed=false 旧快照、合辑发布拒绝或任何网络失败都不得撤销封存提示、
 // 不得重新启用公布/合辑等写控件。服务端封存同样不可逆，此锁存只用于挡住响应交错
@@ -20,18 +26,23 @@ async function refresh() {
   try {
     const r = await fetch("/api/h/" + token);
     const data = await r.json();
-    // 期间已有更新的轮询发出：本响应无论成功或失败都一律作废，不触碰界面
-    if (seq !== pollSeq) return;
+    // 高水位判定：只采纳比最近一次已采纳响应更新的结果。按序返回的慢响应（哪怕
+    // 更晚发起的请求已在途）照常推进页面；乱序晚到的旧响应（含旧成功快照、旧的
+    // 致命错误）序号不高于高水位，一律作废，不触碰界面
+    if (seq <= lastAppliedSeq) return;
     if (!r.ok) {
+      // 致命错误同样按高水位采纳：此后更早的在途响应作废，等待更晚轮询对齐
+      lastAppliedSeq = seq;
       document.getElementById("content").hidden = true;
       const fatal = document.getElementById("fatal");
       fatal.hidden = false;
       fatal.textContent = data.error || "主持链接无效";
       return;
     }
+    lastAppliedSeq = seq;
     s = data;
   } catch {
-    return; // 网络抖动，下次轮询再试；已确认封存时界面保持封存只读
+    return; // 网络抖动不推进高水位，下次轮询再试；已确认封存时界面保持封存只读
   }
   if (s.closed) {
     sealedClosed = true;

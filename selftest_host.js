@@ -18,7 +18,14 @@
  * - 交错二（发布等待期间封存）：合辑发布请求在途时轮询显示封存，随后收到服务端拒绝
  *   （或网络失败）不得重新启用发布按钮；
  * - 封存后 3 秒轮询仍按较新快照更新授权与会话信息（只是不能解除封存）；
- * - 未封存时发布失败（含网络失败）显示原因、保留勾选并恢复按钮供调整重试。
+ * - 未封存时发布失败（含网络失败）显示原因、保留勾选并恢复按钮供调整重试；
+ * - 连续慢响应：状态请求持续慢于 3 秒轮询间隔（各 4 秒、全部成功、按发起顺序返回）
+ *   时，每次成功都推进页面（授权与会话信息持续更新），不会仅因较新请求已在途就丢弃；
+ * - 乱序：较晚发起的请求先被采纳后，较早返回的成功快照或旧 404 都不得覆盖主持状态；
+ * - 失败后恢复：网络失败不推进高水位，较新请求先失败时在途的较早成功仍可推进页面，
+ *   慢响应链中的单次失败不影响按序成功，随后正常轮询恢复更新；
+ * - 封存保护（慢响应路径）：慢响应链中较新响应确认 closed=true 后，在途的旧
+ *   closed=false 快照（连同其旧授权字段）与封存后的网络失败均不能重新启用合辑控件。
  *
  * 运行：node selftest_host.js
  */
@@ -121,6 +128,14 @@ function hostState(overrides = {}) {
 function createPage() {
   const elements = {};
   for (const id of ELEMENT_IDS) elements[id] = new El("div");
+  // 复刻 host.html 中初始即带 hidden 的元素（host.js 只负责把它们显示出来）
+  for (const id of [
+    "fatal", "published-banner", "closed-banner", "close-section",
+    "ack-head", "ack-note", "reports-section",
+    "anthology-section", "anthology-done",
+  ]) {
+    elements[id].hidden = true;
+  }
   const env = {
     elements,
     fetchCalls: [],
@@ -176,9 +191,23 @@ function resolveGet(env, resp, index = -1) {
   return item;
 }
 
-function rejectGet(env, error) {
-  const item = env.pendingGets.shift();
-  assert.ok(item, "应有挂起的状态请求（GET）");
+// 构造一个 200 成功的状态 GET 响应（快照由参数给定，与 env.curState 无关）
+function stateResponse(state) {
+  return { ok: true, status: 200, json: async () => state };
+}
+
+// 构造一个非 2xx 的状态 GET 响应（如主持链接失效的 404）
+function errorResponse(status, body) {
+  return { ok: false, status, json: async () => body };
+}
+
+// 拒绝一个挂起的 GET（默认拒绝最早发起的；多个在途时可用 index 指定，
+// 例如 index=-1 模拟"较晚发起的请求先网络失败、较早请求仍在途"）
+function rejectGet(env, error, index = 0) {
+  const n = env.pendingGets.length;
+  if (index < 0) index = n + index;
+  assert.ok(index >= 0 && index < n, "应有挂起的状态请求（GET）");
+  const [item] = env.pendingGets.splice(index, 1);
   item.reject(error || new Error("network"));
   return item;
 }
@@ -607,6 +636,169 @@ test("封存按钮确认后立即只读：其后轮询网络失败或旧快照�
   s.reviewers[2].anthology_consent = false;
   await poll(env, s);
   await assertClosedUI(env, "封存后正常轮询仍更新信息");
+});
+
+function stateWithConsent(consentFlags, overrides = {}) {
+  const s = hostState(overrides);
+  s.reviewers.forEach((r, i) => {
+    if (i < consentFlags.length) r.anthology_consent = consentFlags[i];
+  });
+  return s;
+}
+
+test("慢响应：请求比 3 秒间隔慢（各 4 秒）时，按序返回的连续成功仍逐次推进页面", async () => {
+  const env = createPage();
+  env.curState = hostState();
+  resolveGet(env); // 首屏
+  await settle(env);
+  await setChecked(env, "甲", true);
+
+  // 模拟请求持续耗时 4 秒、页面每 3 秒发起一次：三次轮询全部在途（无真实等待，
+  // 仅控制响应先后）。旧实现会因 seq !== pollSeq 把三个成功响应全部丢弃，
+  // 授权与会话信息从此不再更新
+  startPoll(env); // seq 2
+  startPoll(env); // seq 3
+  startPoll(env); // seq 4
+  assert.equal(env.pendingGets.length, 3, "三个慢响应请求应同时在途");
+
+  // 服务端按发起顺序先后返回（每次返回时都已有更新的请求在途）：
+  // 每个成功快照都必须被采纳并推进页面，不能因"较新请求尚在途中"而丢弃
+  resolveGet(env, stateResponse(stateWithConsent([false, false, false])), 0);
+  await settle(env);
+  assert.equal(consentText(env, "甲"), "未授权", "第 1 个慢响应应推进授权显示");
+  assert.deepEqual(checkedNames(env), ["甲"], "推进不改动勾选");
+
+  resolveGet(env, stateResponse(stateWithConsent([true, false, false])), 0);
+  await settle(env);
+  assert.equal(consentText(env, "甲"), "已授权", "第 2 个慢响应应继续推进页面");
+
+  resolveGet(env, stateResponse(stateWithConsent([true, true, true])), 0);
+  await settle(env);
+  assert.equal(consentText(env, "乙"), "已授权", "第 3 个慢响应也应推进页面");
+  assert.equal(consentText(env, "丙"), "已授权");
+  assert.deepEqual(checkedNames(env), ["甲"], "连续慢响应后勾选仍保留");
+
+  // 之后恢复正常节奏的轮询照常采纳
+  const next = stateWithConsent([true, true, false]);
+  await poll(env, next);
+  assert.equal(consentText(env, "丙"), "未授权", "恢复正常后轮询仍更新");
+});
+
+test("乱序：较晚发起的请求先被采纳后，较早响应（成功快照或 404）不得覆盖主持状态", async () => {
+  const env = createPage();
+  env.curState = hostState();
+  resolveGet(env); // 首屏
+  await settle(env);
+  await setChecked(env, "甲", true);
+
+  startPoll(env); // seq 2（旧，挂起）
+  startPoll(env); // seq 3（新，先返回）
+  const newer = stateWithConsent([true, true, true]);
+  resolveGet(env, stateResponse(newer), -1);
+  await settle(env);
+  assert.equal(consentText(env, "乙"), "已授权", "较新响应先被采纳");
+
+  // 较早发起的响应这才返回：整份作废，不得用旧快照覆盖
+  resolveGet(env, stateResponse(stateWithConsent([true, false, true])), 0);
+  await settle(env);
+  assert.equal(consentText(env, "乙"), "已授权", "乱序晚到的旧成功快照不得覆盖");
+  assert.deepEqual(checkedNames(env), ["甲"], "旧快照不改动勾选");
+
+  // 三个在途、中间序号先被采纳：更旧与更新的响应各按高水位处理
+  startPoll(env); // seq 4
+  startPoll(env); // seq 5
+  startPoll(env); // seq 6
+  resolveGet(env, stateResponse(stateWithConsent([false, false, false])), 1); // seq 5
+  await settle(env);
+  assert.equal(consentText(env, "甲"), "未授权", "中间序号响应应被采纳");
+  resolveGet(env, stateResponse(stateWithConsent([true, true, true])), 0); // 旧的 seq 4
+  await settle(env);
+  assert.equal(consentText(env, "甲"), "未授权", "更旧的乱序响应不得覆盖");
+  resolveGet(env, stateResponse(stateWithConsent([true, true, false])), -1); // 新的 seq 6
+  await settle(env);
+  assert.equal(consentText(env, "丙"), "未授权", "更新的响应应照常推进");
+
+  // 乱序晚到的旧致命错误（404）同样作废：不能因旧响应把已正常显示的页面打成失效
+  startPoll(env); // seq 7（旧，挂起）
+  startPoll(env); // seq 8（新，成功）
+  resolveGet(env, stateResponse(stateWithConsent([true, true, true])), -1);
+  await settle(env);
+  assert.equal(env.elements["content"].hidden, false);
+  resolveGet(env, errorResponse(404, { error: "主持链接无效" }), 0);
+  await settle(env);
+  assert.equal(env.elements["content"].hidden, false, "乱序晚到的旧 404 不得覆盖主持台");
+  assert.equal(env.elements["fatal"].hidden, true);
+});
+
+test("失败后恢复：网络失败不推进水位，较新失败后在途的较早成功仍可推进，随后正常恢复", async () => {
+  const env = createPage();
+  env.curState = hostState();
+  resolveGet(env); // 首屏
+  await settle(env);
+  await setChecked(env, "丙", true);
+
+  // 较早发起的请求在途，较晚发起的请求先网络失败：失败不推进高水位，
+  // 也不触碰界面；较早的成功响应稍后返回时仍应被采纳
+  startPoll(env); // seq 2（在途）
+  startPoll(env); // seq 3（先失败）
+  rejectGet(env, new Error("network"), -1);
+  await settle(env);
+  assert.equal(consentText(env, "乙"), "未授权", "网络失败不触碰界面");
+  assert.deepEqual(checkedNames(env), ["丙"], "失败不清空勾选");
+  resolveGet(env, stateResponse(stateWithConsent([true, true, true])), 0); // seq 2 成功
+  await settle(env);
+  assert.equal(consentText(env, "乙"), "已授权", "较早的成功响应不应被较新失败挡住");
+
+  // 慢响应链中一次失败：按序的其他成功仍逐次推进
+  startPoll(env); // seq 4
+  startPoll(env); // seq 5
+  startPoll(env); // seq 6
+  rejectGet(env, new Error("network"), 1); // seq 5 失败，不推进水位
+  await settle(env);
+  resolveGet(env, stateResponse(stateWithConsent([false, true, true])), 0); // seq 4 成功
+  await settle(env);
+  assert.equal(consentText(env, "甲"), "未授权", "失败前发起的成功仍推进页面");
+  resolveGet(env, stateResponse(stateWithConsent([false, false, false])), -1); // seq 6 成功
+  await settle(env);
+  assert.equal(consentText(env, "乙"), "未授权", "失败之后更新的成功仍推进页面");
+
+  // 随后的正常轮询恢复更新
+  await poll(env, stateWithConsent([true, true, true]));
+  assert.equal(consentText(env, "甲"), "已授权", "失败恢复后正常轮询照常采纳");
+  assert.deepEqual(checkedNames(env), ["丙"], "恢复后勾选仍保留");
+});
+
+test("封存保护：慢响应链中采纳 closed=true 后，在途旧快照与失败均不能重新启用合辑控件", async () => {
+  const env = createPage();
+  env.curState = hostState();
+  resolveGet(env); // 首屏
+  await settle(env);
+  await setChecked(env, "甲", true);
+  await setChecked(env, "丙", true);
+
+  // 封存前已在途的旧轮询（closed=false）挂起；随后的轮询先确认封存
+  startPoll(env); // seq 2：封存前的旧快照，在途
+  startPoll(env); // seq 3：封存确认，先返回
+  resolveGet(env, stateResponse(stateWithConsent([true, false, true], { closed: true })), -1);
+  await settle(env);
+  await assertClosedUI(env, "慢响应链中较新响应确认封存后应只读");
+
+  // 在途的旧快照（closed=false，且授权较旧）晚到：整份作废，控件与封存提示不变，
+  // 旧授权信息也不得借慢响应路径覆盖
+  resolveGet(env, stateResponse(stateWithConsent([false, false, false], { closed: false })), 0);
+  await settle(env);
+  await assertClosedUI(env, "在途旧 closed=false 快照不得重新启用合辑控件");
+  assert.equal(consentText(env, "甲"), "已授权", "旧快照的授权字段也不得覆盖");
+
+  // 封存后继续 3 秒轮询：网络失败不解除只读，较新成功快照仍更新授权（closed 恒真）
+  startPoll(env); // seq 4
+  rejectGet(env, new Error("network"), -1);
+  await settle(env);
+  await assertClosedUI(env, "封存后的网络失败不得解除只读");
+  const sealedUpdate = stateWithConsent([true, true, true], { closed: true });
+  await poll(env, sealedUpdate);
+  assert.equal(consentText(env, "乙"), "已授权", "封存后较新快照仍更新授权");
+  await assertClosedUI(env, "更新后仍保持封存只读");
 });
 
 (async () => {
